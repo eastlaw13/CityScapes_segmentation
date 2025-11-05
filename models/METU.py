@@ -27,19 +27,19 @@ class MobileViTEncoder(nn.Module):
         self.full_model = timm.create_model(
             f"mobilevit_{self.model_size}", pretrained=self.pretrained
         )
-        self.stem = self.full_model.stem  # Output: [1 16, 112, 112]
-        self.stage0 = self.full_model.stages[0]  # Output: [1 16, 112, 112]
-        self.stage1 = self.full_model.stages[1]  # output: [1, 24, 56, 56]
-        self.stage2 = self.full_model.stages[2]  # output: [1, 48, 28, 28]
-        self.stage3 = self.full_model.stages[3]  # output: [1, 64, 14, 14]
-        self.stage4 = self.full_model.stages[4]  # output: [1, 80, 7, 7]
-        self.final_conv = self.full_model.final_conv  # output: [1, 320, 7, 7]
+        self.stem = self.full_model.stem
+        self.stage0 = self.full_model.stages[0]
+        self.stage1 = self.full_model.stages[1]
+        self.stage2 = self.full_model.stages[2]
+        self.stage3 = self.full_model.stages[3]
+        self.stage4 = self.full_model.stages[4]
+        self.final_conv = self.full_model.final_conv
 
     def forward(self, x):
-        # layer name(B,C,W,H): [stages.0(1 16, 112, 112), stages.1(1, 24, 56, 56]), stages.2(1, 48, 28, 28), stages.3(1, 64, 14, 14), stage.4(1, 80, 7, 7)]
 
         skips_features = []
         out = self.stem(x)
+        skips_features.append(out)
         out = self.stage0(out)
         skips_features.append(out)
 
@@ -95,13 +95,20 @@ class MeTU(nn.Module):
         super().__init__()
         self.encoder = MobileViTEncoder(model_size, encoder_pretrained)
         self.classes = classes
-        # dummy_input: train image shape
-        dummy_input = torch.randn(
-            1, 3, 512, 512
-        )  ##### Should be changed accordig to model_size
-        with torch.no_grad():
-            _, skips = self.encoder(dummy_input)
-        skip_channels = [f.shape[1] for f in skips]
+
+        # without final_conv, channels sizes: [stem, stage0, stage1, stage2, stage3, stage4]
+        if model_size == "xxs":
+            skip_channels = [16, 16, 24, 48, 64, 80]
+        elif model_size == "xs":
+            skip_channels = [16, 32, 48, 64, 80, 96]
+        elif model_size == "s":
+            skip_channels = [16, 32, 64, 96, 128, 160]
+        else:
+            e = print(
+                "[WARNING] No matched size pretrained MobileViT model. Check the model_size input."
+            )
+            return e
+
         bottleneck_ch = self.encoder.final_conv.out_channels
 
         decoder_config = []
@@ -289,9 +296,6 @@ class lt_MeTU(L.LightningModule):
     def test_step(self, batch, batch_idx):
         imgs, msks = batch
         logits = self(imgs)
-        # dice_loss = self.dice_loss(logits, msks, ignore_index=-1)
-
-        # loss = (ce_loss + dice_loss) / 2
 
         ce_loss = F.cross_entropy(
             logits,
@@ -318,17 +322,12 @@ class lt_MeTU(L.LightningModule):
     def on_test_epoch_end(self):
         if not self.test_step_outputs:
             return
-        # m_iou = iou_calculation(self.train_intersections, self.train_unions)
         avg_loss = torch.stack([x["loss"] for x in self.test_step_outputs]).mean()
 
-        # Log test metrics to wandb
         self.log("test/loss", avg_loss, on_epoch=True)
         self._reset_iou_components("test")
 
     def configure_optimizers(self):
-        # ------------------------
-        # Parameter 그룹 분리
-        # ------------------------
         encoder_params = []
         decoder_params = []
 
@@ -336,13 +335,10 @@ class lt_MeTU(L.LightningModule):
             if any(
                 x in name for x in ["encoder.stem", "encoder.stage0", "encoder.stage1"]
             ):
-                encoder_params.append(param)  # pretrained 부분
+                encoder_params.append(param)
             else:
-                decoder_params.append(param)  # decoder + 나머지
+                decoder_params.append(param)
 
-        # ------------------------
-        # Optimizer 정의
-        # ------------------------
         optimizer = torch.optim.AdamW(
             [
                 {"params": encoder_params, "lr": self.learning_rate / 5},  # 낮은 LR
@@ -351,9 +347,6 @@ class lt_MeTU(L.LightningModule):
             weight_decay=1e-4,
         )
 
-        # ------------------------
-        # Scheduler 정의
-        # ------------------------
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=200, eta_min=1e-6
         )
@@ -368,8 +361,7 @@ if __name__ == "__main__":
     from torchinfo import summary
 
     model = lt_MeTU(
-        model_size="xs", encoder_pretrained=True, learning_rate=1e-3, classes=1
+        model_size="xxs", encoder_pretrained=True, learning_rate=1e-3, classes=1
     )
 
-    # model = MobileViTEncoder("xs", pretrained=True)
     summary(model, (1, 3, 512, 512))
