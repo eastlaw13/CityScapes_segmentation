@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torchinfo import summary
 
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from util import iou_component, iou_calculation
+from util import iou_component, iou_calculation, DiceLoss
 
 
 class MobileViTEncoder(nn.Module):
@@ -96,7 +96,9 @@ class MeTU(nn.Module):
         self.encoder = MobileViTEncoder(model_size, encoder_pretrained)
         self.classes = classes
         # dummy_input: train image shape
-        dummy_input = torch.randn(1, 3, 512, 512)
+        dummy_input = torch.randn(
+            1, 3, 512, 512
+        )  ##### Should be changed accordig to model_size
         with torch.no_grad():
             _, skips = self.encoder(dummy_input)
         skip_channels = [f.shape[1] for f in skips]
@@ -142,40 +144,6 @@ class MeTU(nn.Module):
         return out
 
 
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-06):
-        super().__init__()
-        self.smooth = smooth
-
-    def forward(self, logits, targets, ignore_index):
-        """
-        logits: [B, C, H, W]
-        targets: [B, H, W]
-        """
-        if ignore_index is not None:
-            valid_mask = targets != ignore_index
-
-        else:
-            valid_mask = torch.ones_like(targets, dtype=torch.bool)
-
-        targets_onehot = F.one_hot(
-            torch.clamp(targets, min=0), num_classes=logits.shape[1]
-        )
-        targets_onehot = targets_onehot.permute(0, 3, 1, 2).float()
-
-        valid_mask = valid_mask.unsqueeze(1)
-        logits = logits * valid_mask
-        targets_onehot = targets_onehot * valid_mask
-
-        intersection = (logits * targets_onehot).sum(dim=(2, 3))
-        union = logits.sum(dim=(2, 3)) + targets_onehot.sum(dim=(2, 3))
-
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        loss = 1 - dice.mean()
-
-        return loss
-
-
 class lt_MeTU(L.LightningModule):
     def __init__(
         self, learning_rate, model_size="xxs", encoder_pretrained=True, classes=1
@@ -184,18 +152,42 @@ class lt_MeTU(L.LightningModule):
         self.model_size = model_size
         self.encoder_pretrained = encoder_pretrained
         self.classes = classes
-        self.dice_loss = DiceLoss()
         self.learning_rate = learning_rate
         self.save_hyperparameters()
         self._init_iou_components()
         self.validation_step_outputs = []
         self.test_step_outputs = []
-        self.ignore_index = 0
+        self.ignore_index = 255
+        self.dice_loss = DiceLoss(
+            num_classes=self.classes, ignore_index=self.ignore_index
+        )
+
         self.model = MeTU(
             model_size=self.model_size,
             encoder_pretrained=self.encoder_pretrained,
             classes=self.classes,
         )
+        self.ce_weight = [
+            0.011530273140704478,
+            0.069862421303262,
+            0.018625834369019677,
+            0.6485427053032239,
+            0.48453679326756477,
+            0.3463454872108943,
+            2.0448748001723676,
+            0.7710225652140207,
+            0.026688772877345782,
+            0.3671406564359728,
+            0.10577509534799018,
+            0.3487275119018169,
+            3.143860206514013,
+            0.060777757168565524,
+            1.5888982776795386,
+            1.8067743773108866,
+            1.8245108259837337,
+            4.304656325371182,
+            1.026840106179414,
+        ]
 
     def _init_iou_components(self):
         num_classes = self.classes
@@ -232,8 +224,14 @@ class lt_MeTU(L.LightningModule):
     def training_step(self, batch, batch_idx):
         imgs, msks = batch
         logits = self(imgs)
-        loss = F.cross_entropy(logits, msks, ignore_index=self.ignore_index)
+        ce_loss = F.cross_entropy(
+            logits,
+            msks,
+            ignore_index=self.ignore_index,
+        )
+        dice_loss = self.dice_loss(logits, msks)
 
+        loss = 0.7 * ce_loss + 0.3 * dice_loss
         preds = logits.argmax(dim=1)
         inter, union = iou_component(
             preds, msks, self.classes, ignore_idx=self.ignore_index
@@ -255,7 +253,13 @@ class lt_MeTU(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         imgs, msks = batch
         logits = self(imgs)
-        loss = F.cross_entropy(logits, msks, ignore_index=self.ignore_index)
+        ce_loss = F.cross_entropy(
+            logits,
+            msks,
+            ignore_index=self.ignore_index,
+        )
+        dice_loss = self.dice_loss(logits, msks)
+        loss = 0.7 * ce_loss + 0.3 * dice_loss
 
         preds = torch.argmax(logits, dim=1)
         inter, union = iou_component(
@@ -285,11 +289,20 @@ class lt_MeTU(L.LightningModule):
     def test_step(self, batch, batch_idx):
         imgs, msks = batch
         logits = self(imgs)
-        ce_loss = F.cross_entropy(logits, msks, ignore_index=self.ignore_index)
         # dice_loss = self.dice_loss(logits, msks, ignore_index=-1)
 
         # loss = (ce_loss + dice_loss) / 2
-        loss = ce_loss
+
+        ce_loss = F.cross_entropy(
+            logits,
+            msks,
+            ignore_index=self.ignore_index,
+            weight=torch.tensor(
+                self.ce_weight, dtype=torch.float, device=logits.device
+            ),
+        )
+        dice_loss = self.dice_loss(logits, msks)
+        loss = 0.7 * ce_loss + 0.3 * dice_loss
 
         preds = logits.argmax(dim=1)
 
@@ -332,7 +345,7 @@ class lt_MeTU(L.LightningModule):
         # ------------------------
         optimizer = torch.optim.AdamW(
             [
-                {"params": encoder_params, "lr": self.learning_rate * 0.1},  # 낮은 LR
+                {"params": encoder_params, "lr": self.learning_rate / 5},  # 낮은 LR
                 {"params": decoder_params, "lr": self.learning_rate},  # 원래 LR
             ],
             weight_decay=1e-4,
@@ -342,7 +355,7 @@ class lt_MeTU(L.LightningModule):
         # Scheduler 정의
         # ------------------------
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=100, eta_min=1e-6
+            optimizer, T_max=200, eta_min=1e-6
         )
 
         return {
@@ -355,6 +368,8 @@ if __name__ == "__main__":
     from torchinfo import summary
 
     model = lt_MeTU(
-        model_size="xxs", encoder_pretrained=True, learning_rate=1e-3, classes=1
+        model_size="xs", encoder_pretrained=True, learning_rate=1e-3, classes=1
     )
+
+    # model = MobileViTEncoder("xs", pretrained=True)
     summary(model, (1, 3, 512, 512))
